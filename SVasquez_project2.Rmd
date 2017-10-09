@@ -1,0 +1,179 @@
+---
+title: "Silverio J. Vasquez - Project 2"
+author: "Silverio Vasquez"
+date: "October 8, 2017"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(curl)
+library(tidyverse)
+library(ggplot2)
+library(ggthemes)
+library(lmtest)
+library(tseries)
+library(orcutt)
+library(egcm)
+library(forecast)
+library(dygraphs)
+library(vars)
+```
+
+## Are WTI & Brent oil prices co-integrated?
+
+The U.S. Energy Information Administration (under the Department of Energy) publishes a monthly short-term outlook report on energy prices and fundamental data driving those forecast. The EIA also makes available the data in Excel format for transparency. The task at hand is to load a particular sheet from this Excel workbook (already saved as a CSV file and available on my GitHub page), only import WTI and Brent price data, conduct some exploratory data analysis, and confirm if the two price series are co-integrated to perhaps build a pairs trading strategy down the line.
+
+
+First step: Get the data and switch a long format:
+
+```{r data}
+steo <- read_csv(curl("https://raw.githubusercontent.com/sjv1030/Data607-hw/master/STEO_m.csv"),n_max=11)
+
+steo <- steo[,-1] %>% drop_na(X3)
+steo.t <- as.data.frame(t(steo)) 
+
+colnames(steo.t) <- c('year','month','wti','brent','usimpt','usref','gasoline')
+steo.t <- steo.t[-1,]
+
+data <- steo.t %>% 
+        fill(1) %>%
+        unite('date',1:2,sep="-",remove=FALSE) %>%
+         dplyr::select(1:5) %>%
+        mutate(
+                wti = as.numeric(as.character(wti)),
+                brent = as.numeric(as.character(brent)),
+                wti_d = c(0,diff(log(wti))),
+                brent_d = c(0,diff(log(brent))),
+                spread = brent-wti,
+                season = case_when(
+                        .$month == 'Dec' | .$month == 'Jan' | .$month == 'Feb' ~ 'winter',
+                        .$month == 'Mar' | .$month == 'Apr' | .$month == 'May' ~ 'spring',
+                        .$month == 'Jun' | .$month == 'Jul' | .$month == 'Aug' ~ 'summer',
+                        .$month == 'Sep' | .$month == 'Oct' | .$month == 'Nov' ~ 'fall')
+        )
+```
+
+
+Create a time series (XTS object) of both WTI and Brent, as well as the spread, for charting purposes. It's always good to visualize the data beforehand (easy way of spotting outliers, NAs, etc). The charts will only be of actual data as of Aug 2017. Data post Aug 2017 are EIA forecast, which we aren't interested in.
+
+```{r plots}
+idx <- seq(as.Date('2013/1/1'), as.Date('2017/8/1'),"month")
+
+prices <- xts(cbind(data$wti[1:56],data$brent[1:56]),order.by = as.Date(idx))
+colnames(prices) <- c('wti','brent')
+dygraph(prices,main="WTI & Brent Prices")
+
+spread <- xts(data$spread[1:56],order.by=as.Date(idx))
+colnames(spread) <- 'spread'
+dygraph(spread,main="Spread between Brent & WTI")
+```
+
+The spread chart above shows that the difference between Brent & WTI isn't necessarily mean reverting and has dropped significantly since 2013 and 2014. Additionally, the affects of the Harvey hurricane show up in the Aug 2017 data point where the spread widen.
+
+Let's conduct some exploratory data analysis. The data are from 2013 to Aug 2017. For information purposes, it's good to know what the average oil prices have been on an annual basis. As the chart below illustrates, prices have plunged post 2014.
+
+```{r annual}
+annual <- data[1:56,] %>% 
+        group_by(year) %>%
+        summarise(wtiAVG = mean(wti),
+                  brentAVG = mean(brent)
+                  ) %>%
+        gather('oil','price',2:3)
+
+ggplot(annual,aes(x=year,y=price,fill=oil)) +
+        geom_bar(stat='identity',position='dodge', width=0.75) +
+        theme_gdocs() + scale_fill_manual(values = c("gray","navy")) +
+        scale_y_continuous(labels = scales::dollar)
+```
+
+
+Oil prices can be subject to seasonal behavior. At least in the US, oil prices tend to increase as more individuals in the USA tend to drive more increasing gasoline demand, and thereby demand for WTI. Let's confirm this behavior and see if the same thing can be spotted in Brent.
+
+As the chart illustrates, WTI tends to be highest during the summer. Brent tends to be highest during the spring. Perhaps Europeans start their driving season slightly ahead of the USA, or there's something else to explain the difference.
+
+```{r seasons}
+seasonal <- data[1:56,] %>%
+        group_by(season) %>%
+        summarise(wtiAVG = mean(wti),
+                  brentAVG = mean(brent)
+                  ) %>%
+        gather('oil','price',2:3)
+
+ggplot(seasonal,aes(x=season,y=price,fill=oil)) +
+        geom_bar(stat='identity',position='dodge', width=0.75) +
+        theme_gdocs() + scale_fill_manual(values = c("gray","navy")) +
+        scale_y_continuous(labels = scales::dollar)
+```
+
+
+
+## Co-Integration
+
+Now we'll assess if WTI and Brent are strongly statistically related allowing an individual to create a pairs trade by either shorting one and going long the other, or by trading the spread itself (there's a futures contract on it that trades on the Chicago Mercantile Exchange).
+
+First, we'll look at a summary table of our data, then run a basic regression to see if there's a positive or negative relationship between the two.
+
+```{r ols}
+summary(data[1:56,])
+attach(data[1:56,])
+
+reg1 <- lm(wti~brent)
+summary(reg1)
+dwtest(reg1)
+
+reg2 <- lm(brent~wti)
+summary(reg2)
+dwtest(reg2)
+
+```
+
+
+Both basic regressions above indicate strong positive correlation between the two variables. However, the Durbin-Watson test tells us that both equations suffer from serial correlation (this will lead one to make wrong conclusions because the errors aren't normally disturbed, which affect the measures of statistical significance). One solution is to test if the changes in each variable also suffers from serial correlation.
+
+We can test for significance in serial correlation using the augmented Dickey-Fuller (ADF) test:
+
+```{r acf}
+adf.test(wti)
+Acf(wti)
+
+adf.test(brent)
+Acf(brent)
+
+```
+
+For both WTI & Brent, the ADF test confirm what the Durbin-Watson test had already told us, serial correlation exists on the price level data. Let's now run the same test on the first difference of the data:
+
+```{r firstdiff}
+adf.test(wti_d)
+Acf(wti_d)
+adf.test(brent_d)
+Acf(brent_d)
+
+```
+
+The ADF test and ACF plots show that the first differenced data doesn't suffer from serial correlation. Now we can run the same regression as before but using differenced data. However, better techniques exist such as using the Cochrane-Orcutt method. 
+
+```{r orcutt}
+reg1 <- cochrane.orcutt(reg1)
+summary(reg1)
+
+reg2 <- cochrane.orcutt(reg2)
+summary(reg2)
+```
+
+The Cochrane-Orcutt fix address multiple issues with running a regular OLS regression on WTI & Brent. Thankfully, both revised regressions allow us to conclude a statistically significant positive relationship between the two variables.
+
+Now, when two variables aren't stationary (suffer from serial correlation, like WTI & Brent do at the price level), one can still run a very specific type of econometric model called a Vector Error Correction model. This kind of model is used when data are stationary, more information is extracted from price level versus first difference (i.e., the level of oil is more important that the percent change), and the data are co-integrated. 
+
+Co-integrated means the data move more or less in tandem. This is harder to test and a simple correlation analysis won't suffice. In order to test for co-integration, we'll use the egcm function from the egcm package which uses the Engle-Granger Cointegration Model (egcm). Engle and Granger actually won the Nobel prize in economics for this methodology.
+
+```{r egcm}
+e <- egcm(wti,brent, robust = TRUE,normalize=TRUE,log=TRUE)
+summary(e)
+plot(e)
+is.cointegrated(e)
+```
+
+The egcm concludes that there is indeed co-integration. This dataset can now be used to create a pairs trading strategy.
